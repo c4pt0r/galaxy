@@ -5,8 +5,7 @@ import (
 	"errors"
 	"io"
 	"os"
-
-	"github.com/ngaut/log"
+	"sync"
 )
 
 var (
@@ -24,42 +23,46 @@ type needle struct {
 	checksum uint32
 }
 
-func (n *needle) size() uint64 {
-	// magic + key + flag + size + checksum + data
-	return 2 + 8 + 1 + 8 + 4 + n.sz
+func needleMetaSize() int {
+	return 2 + 8 + 1 + 8 + 4
 }
 
-func readNeedleMeta(r io.Reader) (*needle, error) {
-	b := make([]byte, 2)
-	io.ReadFull(r, b)
-	// TODO check magic
+func newNeedleFromBytes(b []byte) *needle {
+	r := &needle{}
+	rdr := bytes.NewBuffer(b)
 
-	n := &needle{}
-
-	key, err := readUint64(r)
+	magic := make([]byte, 2)
+	_, err := rdr.Read(magic)
 	if err != nil {
-		return nil, err
+		return nil
 	}
-	n.key = key
 
-	// read flag
-	b = make([]byte, 1)
-	r.Read(b)
-	n.flg = b[0]
-
-	sz, err := readUint64(r)
+	r.key, err = readUint64(rdr)
 	if err != nil {
-		return nil, err
+		return nil
 	}
-	n.sz = sz
 
-	cs, err := readUint32(r)
+	r.flg, err = rdr.ReadByte()
 	if err != nil {
-		return nil, err
+		return nil
 	}
-	n.checksum = cs
 
-	return n, nil
+	r.sz, err = readUint64(rdr)
+	if err != nil {
+		return nil
+	}
+
+	r.checksum, err = readUint32(rdr)
+	if err != nil {
+		return nil
+	}
+
+	return r
+}
+
+func (n *needle) size() uint64 {
+	// magic + key + flag + size + checksum + data
+	return uint64(needleMetaSize()) + n.sz
 }
 
 func (n *needle) writeMeta(w io.Writer) error {
@@ -102,6 +105,9 @@ type volume struct {
 
 	rdr *os.File
 	fp  *os.File
+
+	lock   sync.Mutex
+	rwlock sync.RWMutex
 }
 
 func CreateVolume(filename string, id uint32, maxSize uint64) error {
@@ -161,10 +167,12 @@ func OpenVolume(filename string) (*volume, error) {
 	}
 	// magic + id + max_size
 	v.cur = 2 + 4 + 8
+	// TODO load index
 	return v, nil
 }
 
 func (v *volume) close() error {
+	// TODO flush index
 	if err := v.fp.Sync(); err != nil {
 		return err
 	}
@@ -190,51 +198,63 @@ func (v *volume) put(key, size uint64, checksum uint32, r io.Reader) error {
 		return ErroNoEnoughRoom
 	}
 
-	// write needle meta
-	err := n.writeMeta(v.fp)
-	if err != nil {
-		return err
-	}
-	// write data
-	_, err = io.CopyN(v.fp, r, int64(size))
-	if err != nil {
-		return err
-	}
-	// call fsync
-	err = v.fp.Sync()
-	if err != nil {
-		return err
-	}
+	// append blob
+	func() {
+		v.lock.Lock()
+		defer v.lock.Unlock()
+		// write needle meta
+		err := n.writeMeta(v.fp)
+		if err != nil {
+			return err
+		}
+		// write data
+		_, err = io.CopyN(v.fp, r, int64(size))
+		if err != nil {
+			return err
+		}
+		// call fsync
+		err = v.fp.Sync()
+		if err != nil {
+			return err
+		}
+	}()
 
 	// update index
+	v.rwlock.Lock()
 	v.index[key] = v.cur
 	// update cur offset for next needle
 	v.cur += n.size()
+	v.rwlock.Unlock()
+
 	return nil
 }
 
 func (v *volume) read(key uint64) (*needle, []byte, error) {
+	v.rwlock.RLock()
 	offset, ok := v.index[key]
-	log.Info(v.index, key)
+	v.rwlock.RUnlock()
 	if !ok {
 		return nil, nil, errors.New("no such key")
 	}
-	_, err := v.rdr.Seek(int64(offset), 0)
+
+	// read needle meta
+	buf := make([]byte, needleMetaSize())
+	_, err := v.rdr.ReadAt(buf, int64(offset))
 	if err != nil {
 		return nil, nil, err
 	}
 
-	n, err := readNeedleMeta(v.rdr)
+	n := newNeedleFromBytes(buf)
+	if n == nil {
+		return nil, nil, errors.New("invalid needle")
+	}
+
+	buf = make([]byte, n.sz)
+	_, err = v.rdr.ReadAt(buf, int64(offset+uint64(needleMetaSize())))
 	if err != nil {
 		return nil, nil, err
 	}
 	n.v = v
-
-	buf := make([]byte, n.sz)
-	_, err = io.ReadFull(v.rdr, buf)
-	if err != nil {
-		return nil, nil, err
-	}
-
+	n.offset = offset
 	return n, buf, nil
 }
